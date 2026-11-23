@@ -1,5 +1,5 @@
 from ren.engine.pattern import RuleSet, pat, rules
-from ren.ir import Op
+from ren.ir import GroupOp, Op
 from ren.ir.node import Node
 from ren.ring import Domain
 from ren.dtype import dtypes
@@ -34,7 +34,8 @@ def _lower_automorphism_store(n: Node, target: Node, auto: Node, x: Node) -> Nod
 
     out_buf = target
     idx = Node(Op.GIDX, dtypes.index)
-    x = x.index(idx).load()
+    if x.base.op not in GroupOp.Elementwise:
+        x = x.index(idx).load()
     i = idx & (nn - 1)
     p_base = idx - i
 

@@ -180,6 +180,22 @@ def test_intt_of_mixed_domain_sum_converts_once(op):
     assert out.tolist() == [op(a, b) % ring.q for a, b in zip([1, 2, 3, 4], [4, 3, 2, 1])]
 
 
+@pytest.mark.parametrize("domain", [Domain.COEFF, Domain.NTT])
+def test_automorphism_computes_elementwise_source(domain):
+    ring = large_prime_ring(4)
+    x = Poly([1, 2, 3, 4], ring, device="python")
+    y = Poly([4, 3, 2, 1], ring, device="python")
+    if domain is Domain.NTT:
+        x, y = x.ntt(), y.ntt()
+    x, y = x.realize(), y.realize()
+    out = (x + y * 3).automorphism(3)
+
+    linear, _ = schedule(Node.sink(out.node))
+
+    assert len(linear.src) == 1
+    assert out.tolist() == (x + y * 3).realize().automorphism(3).tolist()
+
+
 def test_schedule_writes_conversion_output_directly():
     ring = large_prime_ring(4)
     source = Node.new_buffer("python", ring.storage_size, ring.dtype).as_ring(ring, Domain.COEFF)

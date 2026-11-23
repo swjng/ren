@@ -9,7 +9,8 @@ def collect_realize(realize: set[Node]) -> RuleSet:
 
     A node needs realization when it sits at a materialization boundary:
       - SINK outputs (final results consumed externally)
-      - Conversion ops (NTT, INTT, TO_RING, etc.) and their inputs
+      - Conversion ops (NTT, INTT, TO_RING, etc.) and their inputs, except
+        elementwise inputs of an automorphism, which its scatter kernel computes
       - CALL inputs and AFTER values
       - BUFFERIZE / CONTIGUOUS values and random polynomials
 
@@ -25,7 +26,8 @@ def collect_realize(realize: set[Node]) -> RuleSet:
             realize.add(n)
             # Conversion inputs need concrete buffers, including constants. Their
             # storage size can differ from the output's iteration space (e.g. FROM_RNS).
-            realize.update(s for s in n.src if s.base.op not in GroupOp.AlwaysRealized - {Op.CONST})
+            inline = GroupOp.Elementwise if n.op is Op.AUTOMORPHISM else frozenset()
+            realize.update(s for s in n.src if s.base.op not in GroupOp.AlwaysRealized - {Op.CONST} | inline)
 
     return rules([
         (pat.n(Op.SINK), lambda n: realize.update(s for s in n.src if s._device is not None and s.base.op not in GroupOp.AlwaysRealized)),
