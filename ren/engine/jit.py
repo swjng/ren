@@ -1,6 +1,6 @@
 import atexit
 import weakref
-from collections.abc import Callable, Generator, Hashable
+from collections.abc import Callable, Generator, Hashable, Iterable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import InitVar, dataclass, field
@@ -8,8 +8,8 @@ from inspect import signature
 from typing import Any, Concatenate, Protocol, Self, overload
 from types import MethodType
 
+from ren import tree
 from ren.container import PolyContainer
-from ren.tree import Spec
 from ren.backend import GraphRunner
 from ren.buffer import Buffer
 from ren.context import DEBUG, GRAPH
@@ -63,17 +63,24 @@ def _specs_and_bufs(arg_polys: list[Poly]) -> tuple[tuple[ArgSpec, ...], list[Bu
     return tuple(specs), input_bufs
 
 
-# Static (frozen) argument values baked into the captured graph as constants.
-_STATIC_TYPES = bool | int | float | complex | str | bytes | type(None)
+type _ArgKey = tuple[Hashable, tuple[Hashable, ...]]
+type _PlanKey = tuple[tuple[ArgSpec, ...], tuple[_ArgKey, ...], Hashable, str | None]
 
 
-def _collect_scalars(args: tuple, kwargs: dict) -> tuple:
-    """Top-level non-Poly static args, to detect values frozen into the captured graph that silently differ on replay."""
-    # TODO: top-level only -- closure-captured values and metadata nested in
-    # containers still need symbolic tracking.
-    scalars: list = [a for a in args if isinstance(a, _STATIC_TYPES)]
-    scalars += [(k, kwargs[k]) for k in sorted(kwargs) if isinstance(kwargs[k], _STATIC_TYPES)]
-    return tuple(scalars)
+def _varying_value(arguments: dict[str, object], plan_key: _PlanKey, plan_keys: Iterable[_PlanKey]) -> str:
+    """Name the argument value that took the most distinct values across plans with one structure."""
+    structures = [structure for structure, _ in plan_key[1]]
+    rows = [
+        [value for _, values in key[1] for value in values]
+        for key in (*plan_keys, plan_key)
+        if key[2:] == plan_key[2:] and [structure for structure, _ in key[1]] == structures
+    ]
+    counts = [len(set(column)) for column in zip(*rows)]
+    if not counts or max(counts) < 2:
+        return ""
+    paths = [path for name, value in arguments.items() for path in tree.paths(value, leaf=Poly, root=name)]
+    index = max(range(len(counts)), key=counts.__getitem__)
+    return f"; {paths[index]} took {counts[index]} values. Pass values that vary between calls as Poly arguments"
 
 
 def _snapshot_into(dst: Buffer, src: Buffer) -> None:
@@ -152,7 +159,7 @@ class _OutputPlan:
         return [unowned.get(id(poly), poly) for poly in out_polys]
 
     @classmethod
-    def capture(cls, spec: Spec[Any], out_polys: list[Poly], written: set[Buffer]) -> tuple[_OutputPlan, list[Buffer]]:
+    def capture(cls, spec: tree.Spec[Any], out_polys: list[Poly], written: set[Buffer]) -> tuple[_OutputPlan, list[Buffer]]:
         slots: dict[Buffer, int] = {}
         outputs: list[tuple[int, int, RingSpec, Domain]] = []
         initial: list[Poly | None] = [None] * len(out_polys)
@@ -206,7 +213,6 @@ class CapturedPlan:
     bindings: InitVar[list[Buffer]]
     output_plan: _OutputPlan
     reused_output_bases: set[Buffer]
-    frozen_scalars: tuple = ()
     owner: object | None = None  # Keeps resources referenced by the specialization key alive.
     runner: GraphRunner | None = field(init=False, default=None)
 
@@ -262,7 +268,7 @@ atexit.register(lambda: [plan.close() for plan in list(_CAPTURED_PLANS)])
 
 
 class _Jitted[**P, R](Protocol):
-    _plans: dict[tuple[tuple[ArgSpec, ...], Hashable, str | None], CapturedPlan]
+    _plans: dict[_PlanKey, CapturedPlan]
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R: ...
     def clear_jit(self) -> None: ...
@@ -301,9 +307,10 @@ class jit[**P, R]:
         self.fn = fn
         self.prune = prune
         self.static_output = static_output
-        self._plans: dict[tuple[tuple[ArgSpec, ...], Hashable, str | None], CapturedPlan] = {}
+        self._plans: dict[_PlanKey, CapturedPlan] = {}
         self._bound_methods: dict[int, tuple[weakref.ReferenceType, Self]] = {}
         self._owner_type: type | None = None
+        self._signature = signature(fn)
 
     @staticmethod
     @contextmanager
@@ -354,14 +361,14 @@ class jit[**P, R]:
         self,
         args: tuple,
         kwargs: dict,
-        plan_key: tuple[tuple[ArgSpec, ...], Hashable, str | None],
+        plan_key: _PlanKey,
         input_bufs: list[Buffer],
-        frozen_scalars: tuple,
         owner: object | None,
+        arguments: dict[str, object],
     ) -> Any:
         """Capture and build the replay plan for one argument specialization."""
         if len(self._plans) >= MAX_PLANS:
-            raise RuntimeError(f"ren.jit: too many captured plans ({len(self._plans)})")
+            raise RuntimeError(f"ren.jit: too many captured plans ({len(self._plans)}){_varying_value(arguments, plan_key, self._plans)}")
         with trace("jit.capture"):
             assert not capturing, "ren.jit: nested capture invariant violated"
             calls: list[Node] = []
@@ -422,7 +429,7 @@ class jit[**P, R]:
             linear = rewrite_buffers(linear, replace_buffer)
             units = tuple(make_exec_units(linear))
 
-            plan = CapturedPlan(units, capture_bindings, output_plan, reused_output_bases, frozen_scalars, owner)
+            plan = CapturedPlan(units, capture_bindings, output_plan, reused_output_bases, owner)
 
             self._plans[plan_key] = plan
             return ret
@@ -430,7 +437,7 @@ class jit[**P, R]:
     @disable_gc()
     def __call__(self, /, *args: P.args, **kwargs: P.kwargs) -> R:
         if self._owner_type is not None:
-            bound = signature(self.fn).bind(*args, **kwargs)
+            bound = self._signature.bind(*args, **kwargs)
             if bound.args and isinstance(bound.args[0], self._owner_type):
                 if not args:
                     kwargs.pop(next(iter(bound.arguments)))
@@ -440,21 +447,19 @@ class jit[**P, R]:
             raise RuntimeError("ren.jit: nested jit is not supported")
 
         # TODO: Reject Polys hidden in subclasses of tree's opaque scalar types, or require explicit static opt-in.
-        # TODO: Preserve positional/keyword argument bindings; matching Poly specs alone cannot detect swapped inputs.
-        polys = {id(poly): poly for poly in PolyContainer.polys(*args, *(kwargs[key] for key in sorted(kwargs)))}
-        arg_polys = list(polys.values())
+        arguments = self._signature.bind(*args, **kwargs).arguments
+        arg_polys: list[Poly] = []
+        arg_keys: list[_ArgKey] = []
+        for value in arguments.values():
+            polys, key = tree.key(value, leaf=Poly)
+            arg_polys += polys
+            arg_keys.append(key)
         if not arg_polys:
             raise RuntimeError("ren.jit: function must receive at least one Poly argument")
         arg_specs, input_bufs = _specs_and_bufs(arg_polys)
-        scalars = _collect_scalars(args, kwargs)
         context_key, owner = _JIT_CONTEXT.get()
-        plan_key = (arg_specs, context_key, Device._override)
+        plan_key = (arg_specs, tuple(arg_keys), context_key, Device._override)
 
         if (plan := self._plans.get(plan_key)) is not None:
-            if scalars != plan.frozen_scalars:
-                raise RuntimeError(
-                    f"ren.jit: non-Poly scalar arg changed (captured {plan.frozen_scalars}, got {scalars}); "
-                    f"jit freezes it at capture. Pass varying values as Poly arguments, or clear_jit() to re-capture."
-                )
             return plan.replay(input_bufs)
-        return self._capture(args, kwargs, plan_key, input_bufs, scalars, owner)
+        return self._capture(args, kwargs, plan_key, input_bufs, owner, arguments)

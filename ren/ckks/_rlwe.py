@@ -1,7 +1,9 @@
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, fields
+from functools import partial
 from math import pi, sqrt
 from operator import add
-from typing import Self
+from typing import Any, Self
 
 from ren.bigfloat import FloatLike
 from ren.device import Device
@@ -22,6 +24,20 @@ def _fresh_encryption_noise(n: int, error_dist: PolyDistWithBounds) -> CKKSNoise
         noise_heuristic_bound=sqrt(2 * n / 3) * bound,
         msg_bound=0,
     )
+
+
+def _rebuild(cls: type, names: tuple[str, ...], carried: dict[str, Any], *values: Any) -> Any:
+    result = object.__new__(cls)
+    for name, value in (*zip(names, values, strict=True), *carried.items()):
+        object.__setattr__(result, name, value)
+    return result
+
+
+def _reduce_keeping(value: Any, kept: tuple[str, ...]) -> tuple[Callable[..., Any], tuple[Any, ...]]:
+    """Tree reduction over dataclass fields that carries the kept fields through rebuilds."""
+    names = tuple(field.name for field in fields(value) if field.name not in kept)
+    carried = {name: getattr(value, name) for name in kept}
+    return partial(_rebuild, type(value), names, carried), tuple(getattr(value, name) for name in names)
 
 
 @dataclass(slots=True, frozen=True)
@@ -49,6 +65,10 @@ class RLWECiphertext(PolyContainer):
     def __reduce__(self):
         self.realize()
         return super().__reduce__()
+
+    def __tree_reduce__(self):
+        # Noise bounds stay out of tree traversal and jit plan keys.
+        return _reduce_keeping(self, ("noise_info",))
 
     def __add__(self, other) -> Self:
         if self.ring != other.ring:

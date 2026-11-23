@@ -18,7 +18,7 @@ from ren.random import ChaChaRng
 from ren.ring import Residue, RingSpec
 from ren.ckks.errors import InvalidParameterError, ParameterMismatchError
 
-from ._rlwe import RLWECiphertext, _fresh_encryption_noise
+from ._rlwe import RLWECiphertext, _fresh_encryption_noise, _reduce_keeping
 from .context import context
 from .keys import SwitchKey
 from .metadata import CKKSNoiseInfo
@@ -50,6 +50,10 @@ class SlotArithmetic[Other](PolyContainer, ABC):
 
         @property
         def ring(self) -> RingSpec: ...
+
+    def __tree_reduce__(self):
+        # Noise bounds and tracked values stay out of tree traversal and jit plan keys.
+        return _reduce_keeping(self, ("noise_info", "_values"))
 
     @property
     def values(self) -> np.ndarray:

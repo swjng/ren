@@ -1500,8 +1500,8 @@ def test_jit_clear_jit_drops_plans_and_recaptures():
 
     The jitted function takes a non-Poly ``op`` argument that selects
     between two structurally different graphs (addition vs negacyclic
-    multiplication). A changed ``op`` on replay is rejected by the scalar
-    guard; clear_jit() then lets the new branch be captured.
+    multiplication). A changed ``op`` captures a second plan, and the
+    original ``op`` reuses the first. clear_jit() drops both.
     """
     ring = large_prime_ring(4)
 
@@ -1527,21 +1527,58 @@ def test_jit_clear_jit_drops_plans_and_recaptures():
     assert capture_count == 1
     assert len(f._plans) == 1
 
-    # Pass op="mul". The non-Poly arg differs from capture ("add"), so the
-    # guard raises instead of silently replaying the stale additive graph.
-    with pytest.raises(RuntimeError, match="non-Poly scalar arg changed"):
-        f(a, b, "mul")
-    assert capture_count == 1  # no recapture
+    # op="mul" is part of the plan key, so it captures the multiplicative branch.
+    assert f(a, b, "mul").tolist() == expected_mul
+    assert f(a, b, "add").tolist() == expected_add
+    assert capture_count == 2
+    assert len(f._plans) == 2
 
     f.clear_jit()
     assert len(f._plans) == 0
 
-    # After clear_jit(), the next call re-captures and now runs the "mul"
-    # branch, producing the negacyclic product.
-    out2 = f(a, b, "mul")
-    assert out2.tolist() == expected_mul
-    assert capture_count == 2
+    assert f(a, b, "mul").tolist() == expected_mul
+    assert capture_count == 3
     assert len(f._plans) == 1
+
+
+def test_jit_plans_distinguish_argument_structure():
+    ring = large_prime_ring(4)
+    c1, c2, c3 = (Poly([value] * ring.n, ring).realize() for value in (1, 10, 100))
+
+    @ren.jit
+    def combine(left: list[Poly], right: list[Poly]) -> Poly:
+        return sum(left[1:], left[0]) * 2 + sum(right[1:], right[0])
+
+    assert combine([c1, c2], [c3]).tolist()[0] == 122
+    assert combine([c1], [c2, c3]).tolist()[0] == 112
+    assert combine([c1], [c2, c2]).tolist()[0] == 22
+
+    @ren.jit
+    def total(polys: list[Poly]) -> Poly:
+        return sum(polys[1:], polys[0])
+
+    assert total([c1, c2]).tolist()[0] == 11
+    assert total([c1, c1, c2]).tolist()[0] == 12
+
+
+def test_jit_plans_specialize_on_values_inside_arguments(monkeypatch: pytest.MonkeyPatch):
+    ring = large_prime_ring(4)
+    x = Poly([1] * ring.n, ring).realize()
+
+    class Shift:
+        def __init__(self, offsets: list[int]):
+            self.offsets = offsets
+
+    @ren.jit
+    def shift(x: Poly, s: Shift) -> Poly:
+        return x + s.offsets[0]
+
+    assert [shift(x, Shift([offset])).tolist()[0] for offset in (1, 2, 1)] == [2, 3, 2]
+    assert len(shift._plans) == 2
+
+    monkeypatch.setattr(importlib.import_module("ren.engine.jit"), "MAX_PLANS", 2)
+    with pytest.raises(RuntimeError, match=r"s\.offsets\[0\] took 3 values"):
+        shift(x, Shift([3]))
 
 
 def test_prune_tracks_every_output():
@@ -1769,9 +1806,8 @@ def test_jit_gc_scope_covers_capture_cleanup_and_replay(monkeypatch: pytest.Monk
         for _ in range(2):
             assert step(x, 2).tolist() == [2, 4, 6, 8]
             assert gc.isenabled() is enabled
-        with pytest.raises(RuntimeError, match="non-Poly scalar arg changed"):
-            step(x, 3)
+        assert step(x, 3).tolist() == [3, 6, 9, 12]
         assert gc.isenabled() is enabled
-        assert states == [False, False]
+        assert states == [False, False, False]
     finally:
         (gc.enable if was_enabled else gc.disable)()
